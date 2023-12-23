@@ -1,5 +1,6 @@
 ﻿#nullable enable
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.IO.Pipes;
 using System.Linq;
@@ -13,112 +14,123 @@ using TcpControl;
 [assembly: MelonGame("Bohemia Interactive", "Silica")]
 
 namespace TcpControl {
+    [SuppressMessage("ReSharper", "FunctionNeverReturns")]
     public class Class1 : MelonMod
     {
-        private static List<NetworkStream> Streams = new() { };
-        private static MelonLogger.Instance? logger;
-        private static MelonPreferences_Category? Config;
-        private static MelonPreferences_Entry<int>? Port;
-        private static TcpListener? Listener;
+        private static readonly List<TcpClient> Clients = [];
+        private static MelonLogger.Instance? _logger;
+        private static MelonPreferences_Category? _config;
+        private static MelonPreferences_Entry<int>? _port;
+        private static TcpListener? _listener;
         private static NamedPipeClientStream? _pipe;
         private static StreamReader? _pipeReader;
         private static StreamWriter? _pipeWriter;
         
         public override void OnInitializeMelon()
         {
-            Config = MelonPreferences.CreateCategory("TcpConsole");
-            Port = Config.CreateEntry("Port", 8120);
+            _logger = LoggerInstance;
+            _logger.Msg("TcpControl is loading");
             
-            logger = LoggerInstance;
-            logger.Msg("TcpConsole has Loaded");
+            _config = MelonPreferences.CreateCategory("TcpConsole");
+            _port = _config.CreateEntry("Port", 8120);
 
+            _logger.Msg("Created Configs");
+            
             var ipAddress = IPAddress.Parse("127.0.0.1");
-            Listener = new TcpListener(ipAddress, Port.Value);
-        
-            Listener.Start();
+            _listener = new TcpListener(ipAddress, _port.Value);
+            _listener.Start();
+            
+            _logger.Msg("started TCP listener");
+            _logger.Msg(_listener);
+
             
             _pipe = new NamedPipeClientStream(".","SilicaDSPipe", PipeDirection.InOut, PipeOptions.Asynchronous);
             _pipeReader = new StreamReader(_pipe);
             _pipeWriter = new StreamWriter(_pipe);
+
+            _logger.Msg("created named pipe stream");
+            _logger.Msg(_pipeReader);
+            _logger.Msg(_pipeWriter);
             
             Task.Factory.StartNew(HandleConnections, TaskCreationOptions.LongRunning);
             Task.Factory.StartNew(TcpToPipe, TaskCreationOptions.LongRunning);
             Task.Factory.StartNew(PipeToTcp, TaskCreationOptions.LongRunning);
-            
-            base.OnInitializeMelon();
+
+            _logger.Msg("Spawned threads");
+            _logger.Msg("TcpConsole init finished");
         }
         
         public override void OnApplicationQuit()
         {
-            Listener?.Stop();
-            foreach (var stream in Streams)
+            _logger?.Msg("stopping TcpControl");
+            _listener?.Stop();
+            foreach (var stream in Clients)
             {
                 stream.Close();
+                stream.Dispose();
             }
             _pipeReader?.Close();
+            _pipeReader?.Dispose();
             _pipeWriter?.Close();
+            _pipeReader?.Dispose();
             _pipe?.Close();
-            base.OnApplicationQuit();
+            _pipe?.Dispose();
+            _logger?.Msg("Stopped TcpControl");
+        }
+
+        private static void WriteMessages(string message)
+        {
+            _logger?.Msg("Clearing dead connections");
+            Clients.RemoveAll(client => !client.Connected);
+            _logger?.Msg($"transmitting message over tcp: {message}");
+            List<int> toRemove = [];
+            var bytes = Encoding.UTF8.GetBytes(message);
+            foreach (var stream in from client in Clients where client.Connected select client.GetStream())
+            {
+                stream.Write(bytes,0,bytes.Length);
+                stream.Flush();
+            } 
         }
         
-        public void WriteMessages(string message)
+        private static async void HandleConnections()
         {
-            List<int> toRemove = new () {};
-            var bytes = Encoding.UTF8.GetBytes(message);
-            foreach (var stream in Streams)
-            {
-                if (stream.CanWrite)
-                {
-                    stream.Write(bytes,0,bytes.Length);
-                    stream.Flush();
-                }
-                else
-                {
-                    toRemove.Add(Streams.IndexOf(stream));
-                }
-            }
-
-            List<NetworkStream> remap = toRemove.Select(i => Streams[i]).ToList<NetworkStream>();
-            foreach (var snipe in remap)
-            {
-                Streams.Remove(snipe);
-            }
-            //yknow what. screw them. we ain't waiting for them to read our messages, which we cant do on linux anyways. gotta keep that xplat
-        }
-        private async void HandleConnections()
-        {
+            _logger?.Msg("Started TCP connection acceptor thread");
             while (true)
             {
-                var client = Listener!.AcceptTcpClient();
-                var stream = client.GetStream();
-                Streams.Add(stream);
+                _logger?.Msg("Ready to accept tcp connections");
+                var client = await _listener!.AcceptTcpClientAsync();
+                _logger?.Msg("New TCP client connected");
+                Clients.Add(client);
             }
         }
-        private async void TcpToPipe()
+        private static async void TcpToPipe()
         {
+            _logger?.Msg("started TCP to Pipe proxy");
             while (true)
             {
-                foreach (var stream in Streams)
+                var writeCount = 0;
+                foreach (var reader in Clients.Select(client => new StreamReader(client.GetStream())))
                 {
-                    var reader = new StreamReader((Stream) stream);
-                    var line = reader.ReadLine();
-                    if (!string.IsNullOrEmpty(line))
-                    {
-                        _pipeWriter?.Write(line+"\n");
-                    }
+                    var line = await reader.ReadLineAsync();
+                    if (string.IsNullOrEmpty(line)) continue;
+                    _logger?.Msg($"received message from Tcp: {line}");
+                    await _pipeWriter!.WriteAsync(line+"\n");
+                    writeCount += 1;
                 }
-                _pipeWriter?.Flush();
+                if (writeCount <= 0) continue;
+                await _pipeWriter!.FlushAsync();
+                _logger?.Msg($"written from {writeCount} pipes");
             }
         }
-        private async void PipeToTcp()
+        private static async void PipeToTcp()
         {
+            _logger?.Msg("started Pipe to TCP");
             while (true)
             {
-                var line = _pipeReader.ReadLine();
-                if (!string.IsNullOrEmpty(line))
-                {
-                    WriteMessages(line);
-                }
+                var line = await _pipeReader!.ReadLineAsync();
+                if (string.IsNullOrEmpty(line)) continue;
+                WriteMessages(line);
+                _logger?.Msg("finished dispatching messages to TCP connections");
             }
         }
     }
